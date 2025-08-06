@@ -1,0 +1,6 @@
+# Ignore all CSV files (covers datasets and outputs)
+*.csv
+env/
+# Or be more specific if you want:
+data/*.csv  # Just ignore CSVs in the data/ folder (e.g., paysim.csv)
+outputs/*.csv  # Just ignore generated CSVs in outputs/
