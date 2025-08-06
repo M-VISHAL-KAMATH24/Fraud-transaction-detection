@@ -8,10 +8,10 @@ from sklearn.model_selection import train_test_split
 import os
 
 # Ensure outputs folder exists
-os.makedirs('../outputs', exist_ok=True)
+os.makedirs('outputs', exist_ok=True)
 
 # Load dataset
-df = pd.read_csv('../data/paysim.csv')  # Adjust path if needed
+df = pd.read_csv('data/paysim.csv')  # Adjust path if needed
 print("Dataset Head:\n", df.head())
 print("\nDataset Description:\n", df.describe())
 print("\nFraud Distribution:\n", df['isFraud'].value_counts())
@@ -19,7 +19,7 @@ print("\nFraud Distribution:\n", df['isFraud'].value_counts())
 # Visualize and save fraud distribution plot
 sns.countplot(x='isFraud', data=df)
 plt.title('Fraud Distribution')
-plt.savefig('../outputs/fraud_distribution.png')
+plt.savefig('outputs/fraud_distribution.png')
 plt.close()
 print("Fraud distribution plot saved to outputs/fraud_distribution.png")
 
@@ -34,5 +34,5 @@ X_resampled, y_resampled = smote.fit_resample(X_train.select_dtypes('number'), y
 print("\nResampled Fraud Distribution:\n", pd.Series(y_resampled).value_counts())
 
 # Save basic stats (for milestone)
-df.describe().to_csv('../outputs/basic_stats.csv')
+df.describe().to_csv('outputs/basic_stats.csv')
 print("Basic stats saved to outputs/basic_stats.csv")
