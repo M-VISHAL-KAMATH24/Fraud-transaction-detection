@@ -1,5 +1,3 @@
-# scripts/preprocess.py - Data Preprocessing Functions
-
 import pandas as pd
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
