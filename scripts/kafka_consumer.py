@@ -68,25 +68,16 @@ def flatten_features(d):
 
 # River online pipeline: TransformerUnion to combine encoded categoricals and scaled numerics + LogisticRegression
 online_model = compose.Pipeline(
-    compose.TransformerUnion(  # Fixed: Use TransformerUnion class
+    compose.TransformerUnion(
         compose.Select('type') | preprocessing.OneHotEncoder(),
         compose.Select('amount', 'oldbalanceOrg', 'newbalanceOrig', 'oldbalanceDest', 'newbalanceDest', 'step', 'isFlaggedFraud') | preprocessing.StandardScaler()
     ),
     linear_model.LogisticRegression()
 )
 
-# Alternative for HalfSpaceTrees (uncomment if you want anomaly detection; use score_one for pred and threshold)
-# online_model = compose.Pipeline(
-#     compose.TransformerUnion(
-#         compose.Select('type') | preprocessing.OneHotEncoder(),
-#         compose.Select('amount', 'oldbalanceOrg', 'newbalanceOrig', 'oldbalanceDest', 'newbalanceDest', 'step', 'isFlaggedFraud') | preprocessing.StandardScaler()
-#     ),
-#     anomaly.HalfSpaceTrees(n_trees=10, height=8, window_size=250)
-# )
-
 # Online metric and drift detector
 metric = metrics.Accuracy()  # Tracks online accuracy
-drift_detector = drift.ADWIN()  # Detects concept drift in predictions
+drift_detector = drift.ADWIN(delta=0.001)  # Added: Detects concept drift; adjust delta for sensitivity
 
 # Kafka consumer config
 consumer = Consumer({
@@ -116,7 +107,7 @@ while True:
     processed = preprocessor.transform(df)
 
     # Offline prediction
-    offline_pred = offline_model.predict(processed)[0]  # Scalar output
+    offline_pred = offline_model.predict(processed)  # Scalar output
 
     # Simulate feedback loop
     if offline_pred == 1:
@@ -133,10 +124,19 @@ while True:
     # Update metric
     metric.update(confirmed_label, online_pred)
 
-    # Check for drift
-    drift_detector.update(offline_pred)
+    # Added: Check for concept drift using prediction error
+    prediction_error = abs(confirmed_label - online_pred)  # 0 or 1 error
+    drift_detector.update(prediction_error)
     if drift_detector.drift_detected:
-        print("Concept drift detected! Model may need reset or further adaptation.")
+        print("Concept drift detected! Resetting online model for adaptation.")
+        # Reset to fresh model on drift
+        online_model = compose.Pipeline(
+            compose.TransformerUnion(
+                compose.Select('type') | preprocessing.OneHotEncoder(),
+                compose.Select('amount', 'oldbalanceOrg', 'newbalanceOrig', 'oldbalanceDest', 'newbalanceDest', 'step', 'isFlaggedFraud') | preprocessing.StandardScaler()
+            ),
+            linear_model.LogisticRegression()
+        )
 
     # Output
     print(f"Received: {features_dict} | Offline Pred: {offline_pred} | Online Pred: {online_pred} | Confirmed Label: {confirmed_label} | Online Accuracy: {metric.get()}")
