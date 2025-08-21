@@ -6,6 +6,7 @@ import numpy as np
 import random  # For simulating feedback
 import os  # To suppress TensorFlow warnings
 from geopy.distance import geodesic  # For geo distance calculation
+import psycopg2  # New: For PostgreSQL connection
 
 # Suppress TensorFlow warnings
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -17,6 +18,7 @@ from river import metrics  # Accuracy tracking
 from river import drift  # ADWIN for concept drift
 from river import preprocessing  # For OneHotEncoder and StandardScaler
 from river import anomaly  # For HalfSpaceTrees if used
+from river import optim  # Added: For custom optimizer with higher learning rate
 
 # LSTMWrapper class (required for loading ensemble)
 from sklearn.base import BaseEstimator, ClassifierMixin
@@ -52,8 +54,9 @@ class LSTMWrapper(BaseEstimator, ClassifierMixin):
 offline_model = joblib.load('../models/ensemble_model.pkl')  # Adjust path if needed
 preprocessor = joblib.load('../models/preprocessor.pkl')
 
-# Load mock user DB for geo checks
-user_df = pd.read_csv('mock_users.csv')  # Assumes generated from generate_mock_users.py
+# New: PostgreSQL connection (use your actual password; consider env vars for security)
+conn = psycopg2.connect(dbname='fraud_db', user='postgres', password='vil100sr', host='localhost', port='5432')
+cursor = conn.cursor()
 
 # Function to flatten any sequence values to scalars (fixes TypeError)
 def flatten_features(d):
@@ -88,17 +91,30 @@ def safe_coords(lat, long):
         return (0.0, 0.0)  # Safe fallback to avoid crash
 
 # River online pipeline: TransformerUnion to combine encoded categoricals and scaled numerics + LogisticRegression
+# Updated: Added optimizer with higher learning rate for faster adaptation
 online_model = compose.Pipeline(
     compose.TransformerUnion(
         compose.Select('type') | preprocessing.OneHotEncoder(),
         compose.Select('amount', 'oldbalanceOrg', 'newbalanceOrig', 'oldbalanceDest', 'newbalanceDest', 'step', 'isFlaggedFraud') | preprocessing.StandardScaler()
     ),
-    linear_model.LogisticRegression()
+    linear_model.LogisticRegression(optimizer=optim.SGD(lr=0.1))  # Increased from default 0.01
 )
 
 # Online metric and drift detector
 metric = metrics.Accuracy()  # Tracks online accuracy
-drift_detector = drift.ADWIN(delta=0.001)  # Added: Detects concept drift; adjust delta for sensitivity
+drift_detector = drift.ADWIN(delta=0.01)  # Updated: Less sensitive (from 0.001) to avoid over-resetting
+
+# Added: Warm-up the model with initial data to reduce initial bias toward 0
+warmup_data = [
+    ({'type': 'PAYMENT', 'amount': 100.0, 'oldbalanceOrg': 1000.0, 'newbalanceOrig': 900.0, 'oldbalanceDest': 0.0, 'newbalanceDest': 100.0, 'step': 1, 'isFlaggedFraud': 0}, 0),
+    ({'type': 'TRANSFER', 'amount': 50000.0, 'oldbalanceOrg': 0.0, 'newbalanceOrig': 0.0, 'oldbalanceDest': 0.0, 'newbalanceDest': 50000.0, 'step': 10, 'isFlaggedFraud': 1}, 1),
+    ({'type': 'CASH_IN', 'amount': 500.0, 'oldbalanceOrg': 2000.0, 'newbalanceOrig': 2500.0, 'oldbalanceDest': 100.0, 'newbalanceDest': 0.0, 'step': 2, 'isFlaggedFraud': 0}, 0),
+    ({'type': 'CASH_OUT', 'amount': 100000.0, 'oldbalanceOrg': 100.0, 'newbalanceOrig': 0.0, 'oldbalanceDest': 0.0, 'newbalanceDest': 100000.0, 'step': 20, 'isFlaggedFraud': 1}, 1),
+    ({'type': 'DEBIT', 'amount': 50.0, 'oldbalanceOrg': 500.0, 'newbalanceOrig': 450.0, 'oldbalanceDest': 0.0, 'newbalanceDest': 50.0, 'step': 3, 'isFlaggedFraud': 0}, 0),
+]
+for x, y in warmup_data:
+    online_model.learn_one(x, y)
+print("Model warmed up with initial data.")
 
 # Kafka consumer config
 consumer = Consumer({
@@ -156,36 +172,53 @@ while True:
                 compose.Select('type') | preprocessing.OneHotEncoder(),
                 compose.Select('amount', 'oldbalanceOrg', 'newbalanceOrig', 'oldbalanceDest', 'newbalanceDest', 'step', 'isFlaggedFraud') | preprocessing.StandardScaler()
             ),
-            linear_model.LogisticRegression()
+            linear_model.LogisticRegression(optimizer=optim.SGD(lr=0.1))  # Maintain higher lr on reset
         )
 
-    # Added: Geo fraud check (lookup user and calculate distance)
-    user_row = user_df[user_df['user_id'] == features_dict.get('user_id', '')]  # Safe get
-    if len(user_row) == 0:
-        print("User not found in mock DB, skipping geo check")
-        geo_flag = 0  # Default no flag if user missing
-        distance_km = 0.0
-    else:
-        user = user_row.iloc[0]
-        home_lat = user.get('billing_lat', 0.0)
-        home_long = user.get('billing_long', 0.0)
-        txn_lat = features_dict.get('tx_lat', 0.0)
-        txn_long = features_dict.get('tx_long', 0.0)
-        home_coords = safe_coords(home_lat, home_long)  # Validate/fix
-        txn_coords = safe_coords(txn_lat, txn_long)    # Validate/fix
-        try:
-            distance_km = geodesic(home_coords, txn_coords).km
-            geo_flag = 1 if distance_km > 100 else 0  # Flag if >100km
-        except ValueError as e:
-            print(f"Geo error: {e} - Skipping distance calc")
+    # Added: Geo fraud check (lookup user from DB and calculate distance)
+    user_id = features_dict.get('user_id', '')
+    try:
+        cursor.execute("SELECT billing_lat, billing_long FROM users WHERE user_id = %s", (user_id,))
+        user_row = cursor.fetchone()
+        if user_row is None:
+            print("User not found in DB, skipping geo check")
             geo_flag = 0
             distance_km = 0.0
+        else:
+            home_lat, home_long = user_row
+            txn_lat = features_dict.get('tx_lat', 0.0)
+            txn_long = features_dict.get('tx_long', 0.0)
+            home_coords = safe_coords(home_lat, home_long)
+            txn_coords = safe_coords(txn_lat, txn_long)
+            distance_km = geodesic(home_coords, txn_coords).km
+            geo_flag = 1 if distance_km > 10000 else 0
+    except Exception as e:
+        print(f"DB query error: {e} - Skipping geo check and rolling back")
+        conn.rollback()
+        geo_flag = 0
+        distance_km = 0.0
 
     # Combine with existing preds (e.g., OR logic)
     final_pred = 1 if offline_pred == 1 or online_pred == 1 or geo_flag == 1 else 0
+
+    # Log to transactions table
+    try:
+        cursor.execute("""
+            INSERT INTO transactions (user_id, transaction_data, offline_pred, online_pred, geo_flag, final_pred)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (user_id, json.dumps(features_dict), int(offline_pred), int(online_pred), int(geo_flag), int(final_pred)))
+        conn.commit()
+        print("Successfully inserted transaction for user:", user_id)
+    except Exception as e:
+        print(f"DB insert error: {e} - Rolling back")
+        conn.rollback()
 
     # Output (enhanced with geo info)
     print(f"Received: {features_dict} | Offline Pred: {offline_pred} | Online Pred: {online_pred} | "
           f"Geo Flag: {geo_flag} (Distance: {distance_km:.2f}km) | Final Pred: {final_pred} | Confirmed Label: {confirmed_label} | Online Accuracy: {metric.get()}")
 
     consumer.commit()
+
+# Clean up (at end, if script exits)
+cursor.close()
+conn.close()
