@@ -5,6 +5,7 @@ import joblib
 import numpy as np
 import random  # For simulating feedback
 import os  # To suppress TensorFlow warnings
+from geopy.distance import geodesic  # For geo distance calculation
 
 # Suppress TensorFlow warnings
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -51,6 +52,9 @@ class LSTMWrapper(BaseEstimator, ClassifierMixin):
 offline_model = joblib.load('../models/ensemble_model.pkl')  # Adjust path if needed
 preprocessor = joblib.load('../models/preprocessor.pkl')
 
+# Load mock user DB for geo checks
+user_df = pd.read_csv('mock_users.csv')  # Assumes generated from generate_mock_users.py
+
 # Function to flatten any sequence values to scalars (fixes TypeError)
 def flatten_features(d):
     flat = {}
@@ -65,6 +69,23 @@ def flatten_features(d):
             except (ValueError, TypeError):
                 flat[k] = 0.0  # Fallback for invalid
     return flat
+
+# New: Safe coord validation to fix ValueError (checks range, converts to float, swaps if needed)
+def safe_coords(lat, long):
+    try:
+        lat = float(lat)
+        long = float(long)
+        # If lat is out of [-90,90], assume swapped with long and fix
+        if not (-90 <= lat <= 90):
+            lat, long = long, lat  # Swap
+            if not (-90 <= lat <= 90):  # Still invalid?
+                raise ValueError(f"Invalid latitude after swap: {lat}")
+        if not (-180 <= long <= 180):
+            raise ValueError(f"Invalid longitude: {long}")
+        return (lat, long)
+    except Exception as e:
+        print(f"Coord error: {e} - Using default (0,0)")
+        return (0.0, 0.0)  # Safe fallback to avoid crash
 
 # River online pipeline: TransformerUnion to combine encoded categoricals and scaled numerics + LogisticRegression
 online_model = compose.Pipeline(
@@ -107,7 +128,7 @@ while True:
     processed = preprocessor.transform(df)
 
     # Offline prediction
-    offline_pred = offline_model.predict(processed)  # Scalar output
+    offline_pred = offline_model.predict(processed)[0]  # Scalar output
 
     # Simulate feedback loop
     if offline_pred == 1:
@@ -138,7 +159,33 @@ while True:
             linear_model.LogisticRegression()
         )
 
-    # Output
-    print(f"Received: {features_dict} | Offline Pred: {offline_pred} | Online Pred: {online_pred} | Confirmed Label: {confirmed_label} | Online Accuracy: {metric.get()}")
+    # Added: Geo fraud check (lookup user and calculate distance)
+    user_row = user_df[user_df['user_id'] == features_dict.get('user_id', '')]  # Safe get
+    if len(user_row) == 0:
+        print("User not found in mock DB, skipping geo check")
+        geo_flag = 0  # Default no flag if user missing
+        distance_km = 0.0
+    else:
+        user = user_row.iloc[0]
+        home_lat = user.get('billing_lat', 0.0)
+        home_long = user.get('billing_long', 0.0)
+        txn_lat = features_dict.get('tx_lat', 0.0)
+        txn_long = features_dict.get('tx_long', 0.0)
+        home_coords = safe_coords(home_lat, home_long)  # Validate/fix
+        txn_coords = safe_coords(txn_lat, txn_long)    # Validate/fix
+        try:
+            distance_km = geodesic(home_coords, txn_coords).km
+            geo_flag = 1 if distance_km > 100 else 0  # Flag if >100km
+        except ValueError as e:
+            print(f"Geo error: {e} - Skipping distance calc")
+            geo_flag = 0
+            distance_km = 0.0
+
+    # Combine with existing preds (e.g., OR logic)
+    final_pred = 1 if offline_pred == 1 or online_pred == 1 or geo_flag == 1 else 0
+
+    # Output (enhanced with geo info)
+    print(f"Received: {features_dict} | Offline Pred: {offline_pred} | Online Pred: {online_pred} | "
+          f"Geo Flag: {geo_flag} (Distance: {distance_km:.2f}km) | Final Pred: {final_pred} | Confirmed Label: {confirmed_label} | Online Accuracy: {metric.get()}")
 
     consumer.commit()
