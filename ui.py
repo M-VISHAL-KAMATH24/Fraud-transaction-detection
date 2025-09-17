@@ -26,19 +26,15 @@ with st.form("transaction_form"):
     with col2:
         old_balance_org = st.number_input("Sender's Old Balance", value=10000.0)
         new_balance_orig = st.number_input("Sender's New Balance", value=9849.25)
-        old_balance_dest = st_number_input = st.number_input("Receiver's Old Balance", value=2000.0)
+        old_balance_dest = st.number_input("Receiver's Old Balance", value=2000.0)
         new_balance_dest = st.number_input("Receiver's New Balance", value=2150.75)
     
-    # Hidden fields needed by the model
-    step = st.hidden("Step", 1)
-    is_flagged_fraud = st.hidden("Is Flagged Fraud (System)", 0)
-    tx_lat = st.hidden("Transaction Latitude", 40.7128) # Default to NYC
-    tx_long = st.hidden("Transaction Longitude", -74.0060) # Default to NYC
-
+    # The submit button is now correctly placed as the main action for the form.
     submitted = st.form_submit_button("Submit for Fraud Check")
 
 # --- Form Submission Logic ---
 if submitted:
+    # Here we build the full data payload, including the "hidden" values
     transaction_data = {
         "user_id": user_id,
         "type": transaction_type,
@@ -47,10 +43,12 @@ if submitted:
         "newbalanceOrig": new_balance_orig,
         "oldbalanceDest": old_balance_dest,
         "newbalanceDest": new_balance_dest,
+        
+        # These values are now added directly, not as UI elements
         "step": 1,
         "isFlaggedFraud": 0,
-        "tx_lat": tx_lat,
-        "tx_long": tx_long,
+        "tx_lat": 40.7128, # Default to NYC for demo
+        "tx_long": -74.0060, # Default to NYC for demo
     }
 
     st.subheader("Processing...")
