@@ -24,24 +24,26 @@ DB_CONFIG = {
 def get_db_connection():
     return psycopg2.connect(**DB_CONFIG)
 
-# --- NEW API Endpoint to fetch users for the UI ---
+# --- API Endpoint to fetch users for the UI ---
 @app.route('/get_users', methods=['GET'])
 def get_users():
     """Fetches all users from the database."""
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
-    cursor.execute("SELECT user_id, user_name, current_balance FROM users ORDER BY user_id;")
+    
+    # === THE FIX IS ON THIS LINE ===
+    # We now also select the 'email' column
+    cursor.execute("SELECT user_id, user_name, current_balance, email FROM users ORDER BY user_id;")
+    
     users = cursor.fetchall()
     cursor.close()
     conn.close()
     return jsonify(users)
 
-# --- UPDATED Endpoint to handle realistic transactions ---
+
+# --- The rest of your api.py file remains unchanged ---
 @app.route('/submit_transaction', methods=['POST'])
 def submit_transaction():
-    """
-    Receives a transfer request, calculates balances, logs it, and sends to Kafka.
-    """
     data = request.get_json()
     sender_id = data.get('sender_id')
     receiver_id = data.get('receiver_id')
@@ -53,8 +55,6 @@ def submit_transaction():
     try:
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
-
-        # Get sender and receiver details in one query
         cursor.execute("SELECT * FROM users WHERE user_id IN (%s, %s);", (sender_id, receiver_id))
         users = {u['user_id']: u for u in cursor.fetchall()}
 
@@ -64,24 +64,19 @@ def submit_transaction():
         if not sender or not receiver:
             return jsonify({"error": "Invalid sender or receiver ID"}), 404
         
-        if sender['current_balance'] < amount:
+        if float(sender['current_balance']) < amount:
             return jsonify({"error": "Insufficient balance"}), 400
 
-        # Prepare the full transaction payload for the model
         transaction_payload = {
-            "type": "TRANSFER",
+            "type": "TRANSFER", "user_id": sender_id, "receiver_id": receiver_id,
             "amount": amount,
-            "user_id": sender_id,      # Pass sender_id
-            "receiver_id": receiver_id, # Pass receiver_id
             "oldbalanceOrg": float(sender['current_balance']),
             "newbalanceOrig": float(sender['current_balance']) - amount,
             "oldbalanceDest": float(receiver['current_balance']),
             "newbalanceDest": float(receiver['current_balance']) + amount,
-            "step": 1, # Default value
-            "isFlaggedFraud": 0, # Default value
+            "step": 1, "isFlaggedFraud": 0,
         }
 
-        # Log the pending transaction to the database
         cursor.execute(
             "INSERT INTO transactions (user_id, transaction_data, status) VALUES (%s, %s, %s) RETURNING transaction_id;",
             (sender_id, json.dumps(transaction_payload), 'pending')
@@ -89,7 +84,6 @@ def submit_transaction():
         transaction_id = cursor.fetchone()['transaction_id']
         conn.commit()
 
-        # Add the transaction_id to the payload and send to Kafka
         transaction_payload['transaction_id'] = transaction_id
         producer.produce(KAFKA_TOPIC, value=json.dumps(transaction_payload))
         producer.flush()
@@ -104,10 +98,8 @@ def submit_transaction():
             cursor.close()
             conn.close()
 
-# --- UNCHANGED Endpoint to fetch results ---
 @app.route('/get_prediction/<int:transaction_id>', methods=['GET'])
 def get_prediction(transaction_id):
-    """Checks the database for the prediction result."""
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     cursor.execute("SELECT is_fraud, prediction_details FROM predictions WHERE transaction_id = %s", (transaction_id,))

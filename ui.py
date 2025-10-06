@@ -8,7 +8,7 @@ st.set_page_config(page_title="Mobile Money Transfer", layout="centered")
 API_URL = "http://127.0.0.1:5000"
 
 # --- Data Fetching Function ---
-@st.cache_data(ttl=15)
+@st.cache_data(ttl=10) # Cache user data for 10 seconds
 def get_users():
     """Fetches the list of users and their balances from the API."""
     try:
@@ -33,37 +33,48 @@ else:
 
     st.header("Create a New Transaction")
 
+    # --- User and Amount Selection ---
     col1, col2 = st.columns(2)
     with col1:
         sender_name = st.selectbox("Select Sender", user_names, index=0, key="sender_select")
-        sender_id = user_dict[sender_name]['user_id']
-        # FIX: Convert the balance from string to float right when we get it
-        sender_balance = float(user_dict[sender_name]['current_balance'])
+        # Get the full sender object
+        sender = user_dict[sender_name]
+        sender_balance = float(sender['current_balance'])
+        # Get the sender's email
+        sender_email = sender.get('email', 'N/A') # Use .get() for safety
+        
         st.info(f"Current Balance: **${sender_balance:,.2f}**")
+        # Display the email
+        st.caption(f"Email: {sender_email}")
+
 
     with col2:
         available_receivers = [name for name in user_names if name != sender_name]
         receiver_name = st.selectbox("Select Receiver", available_receivers, index=min(1, len(available_receivers)-1), key="receiver_select")
-        receiver_id = user_dict[receiver_name]['user_id']
-        # FIX: Also convert the receiver's balance for consistency
-        receiver_balance = float(user_dict[receiver_name]['current_balance'])
+        # Get the full receiver object
+        receiver = user_dict[receiver_name]
+        receiver_balance = float(receiver['current_balance'])
+        # Get the receiver's email
+        receiver_email = receiver.get('email', 'N/A')
+        
         st.info(f"Current Balance: **${receiver_balance:,.2f}**")
+        # Display the email
+        st.caption(f"Email: {receiver_email}")
 
-    amount = st.number_input("Amount to Transfer", min_value=1.00, value=100.00, step=50.0, format="%.2f")
+    amount = st.number_input("Amount to Transfer", min_value=0.01, value=100.00, step=50.0, format="%.2f")
 
+    # --- Submission Logic ---
     if st.button("Send Money", use_container_width=True):
-        # Now the comparison will work because both are numbers
         if amount > sender_balance:
             st.error("Transfer amount cannot exceed sender's balance.")
         else:
             payload = {
-                "sender_id": sender_id,
-                "receiver_id": receiver_id,
+                "sender_id": sender['user_id'],
+                "receiver_id": receiver['user_id'],
                 "amount": amount
             }
             
             with st.spinner("Submitting transaction for fraud analysis..."):
-                # The rest of the logic is the same and will work correctly
                 submit_response = requests.post(f"{API_URL}/submit_transaction", json=payload)
 
                 if submit_response.status_code != 202:
