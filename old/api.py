@@ -1,3 +1,4 @@
+# api.py (Updated)
 from flask import Flask, request, jsonify
 from confluent_kafka import Producer
 import json
@@ -24,7 +25,8 @@ DB_CONFIG = {
 def get_db_connection():
     return psycopg2.connect(**DB_CONFIG)
 
-# --- NEW API Endpoint to fetch users for the UI ---
+# --- NEW API Endpoints ---
+
 @app.route('/get_users', methods=['GET'])
 def get_users():
     """Fetches all users from the database."""
@@ -36,7 +38,8 @@ def get_users():
     conn.close()
     return jsonify(users)
 
-# --- UPDATED Endpoint to handle realistic transactions ---
+# --- UPDATED Endpoints ---
+
 @app.route('/submit_transaction', methods=['POST'])
 def submit_transaction():
     """
@@ -71,17 +74,15 @@ def submit_transaction():
         transaction_payload = {
             "type": "TRANSFER",
             "amount": amount,
-            "user_id": sender_id,      # Pass sender_id
-            "receiver_id": receiver_id, # Pass receiver_id
-            "oldbalanceOrg": float(sender['current_balance']),
-            "newbalanceOrig": float(sender['current_balance']) - amount,
-            "oldbalanceDest": float(receiver['current_balance']),
-            "newbalanceDest": float(receiver['current_balance']) + amount,
+            "oldbalanceOrg": sender['current_balance'],
+            "newbalanceOrig": sender['current_balance'] - amount,
+            "oldbalanceDest": receiver['current_balance'],
+            "newbalanceDest": receiver['current_balance'] + amount,
             "step": 1, # Default value
             "isFlaggedFraud": 0, # Default value
         }
 
-        # Log the pending transaction to the database
+        # Log the pending transaction
         cursor.execute(
             "INSERT INTO transactions (user_id, transaction_data, status) VALUES (%s, %s, %s) RETURNING transaction_id;",
             (sender_id, json.dumps(transaction_payload), 'pending')
@@ -89,10 +90,13 @@ def submit_transaction():
         transaction_id = cursor.fetchone()['transaction_id']
         conn.commit()
 
-        # Add the transaction_id to the payload and send to Kafka
+        # Add the ID and send to Kafka
         transaction_payload['transaction_id'] = transaction_id
         producer.produce(KAFKA_TOPIC, value=json.dumps(transaction_payload))
         producer.flush()
+
+        # IMPORTANT: We only update balances AFTER the transaction is approved
+        # This is handled by the consumer now.
 
         return jsonify({"message": "Transaction submitted for fraud check.", "transaction_id": transaction_id}), 202
 
@@ -100,11 +104,11 @@ def submit_transaction():
         print(f"API Error: {e}")
         return jsonify({"error": "An internal error occurred."}), 500
     finally:
-        if 'conn' in locals() and not conn.closed:
+        if 'conn' in locals():
             cursor.close()
             conn.close()
 
-# --- UNCHANGED Endpoint to fetch results ---
+
 @app.route('/get_prediction/<int:transaction_id>', methods=['GET'])
 def get_prediction(transaction_id):
     """Checks the database for the prediction result."""
@@ -119,6 +123,7 @@ def get_prediction(transaction_id):
         return jsonify({"status": "completed", "is_fraud": prediction['is_fraud'], "details": prediction['prediction_details']})
     else:
         return jsonify({"status": "pending"}), 202
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

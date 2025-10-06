@@ -1,97 +1,94 @@
 import streamlit as st
 import requests
 import time
-import json
-import random
 
-st.set_page_config(page_title="Real-Time Fraud Detection", layout="wide")
-
-st.title("💳 Real-Time Transaction Fraud Detection")
-st.write("Submit a transaction to see if it's flagged as fraudulent by our live AI model.")
+st.set_page_config(page_title="Mobile Money Transfer", layout="centered")
 
 # --- API Configuration ---
 API_URL = "http://127.0.0.1:5000"
 
-# --- Form for User Input ---
-with st.form("transaction_form"):
-    st.header("Transaction Details")
-    
+# --- Data Fetching Function ---
+@st.cache_data(ttl=15)
+def get_users():
+    """Fetches the list of users and their balances from the API."""
+    try:
+        response = requests.get(f"{API_URL}/get_users", timeout=5)
+        if response.status_code == 200:
+            return response.json()
+    except requests.RequestException:
+        return []
+    return []
+
+# --- Main App ---
+st.title("💸 Mobile Money Transfer")
+
+users = get_users()
+
+if not users:
+    st.error("Could not connect to the API to fetch users. Is `api.py` running?")
+    st.stop()
+else:
+    user_dict = {u['user_name']: u for u in users}
+    user_names = sorted(user_dict.keys())
+
+    st.header("Create a New Transaction")
+
     col1, col2 = st.columns(2)
-    
     with col1:
-        user_id = st.text_input("User ID", value=f"user_{random.randint(1, 15)}")
-        amount = st.number_input("Amount", min_value=0.01, value=150.75, step=10.0, format="%.2f")
-        transaction_type = st.selectbox("Transaction Type", ["PAYMENT", "TRANSFER", "CASH_OUT", "DEBIT", "CASH_IN"])
+        sender_name = st.selectbox("Select Sender", user_names, index=0, key="sender_select")
+        sender_id = user_dict[sender_name]['user_id']
+        # FIX: Convert the balance from string to float right when we get it
+        sender_balance = float(user_dict[sender_name]['current_balance'])
+        st.info(f"Current Balance: **${sender_balance:,.2f}**")
 
     with col2:
-        old_balance_org = st.number_input("Sender's Old Balance", value=10000.0)
-        new_balance_orig = st.number_input("Sender's New Balance", value=9849.25)
-        old_balance_dest = st.number_input("Receiver's Old Balance", value=2000.0)
-        new_balance_dest = st.number_input("Receiver's New Balance", value=2150.75)
-    
-    # The submit button is now correctly placed as the main action for the form.
-    submitted = st.form_submit_button("Submit for Fraud Check")
+        available_receivers = [name for name in user_names if name != sender_name]
+        receiver_name = st.selectbox("Select Receiver", available_receivers, index=min(1, len(available_receivers)-1), key="receiver_select")
+        receiver_id = user_dict[receiver_name]['user_id']
+        # FIX: Also convert the receiver's balance for consistency
+        receiver_balance = float(user_dict[receiver_name]['current_balance'])
+        st.info(f"Current Balance: **${receiver_balance:,.2f}**")
 
-# --- Form Submission Logic ---
-if submitted:
-    # Here we build the full data payload, including the "hidden" values
-    transaction_data = {
-        "user_id": user_id,
-        "type": transaction_type,
-        "amount": amount,
-        "oldbalanceOrg": old_balance_org,
-        "newbalanceOrig": new_balance_orig,
-        "oldbalanceDest": old_balance_dest,
-        "newbalanceDest": new_balance_dest,
-        
-        # These values are now added directly, not as UI elements
-        "step": 1,
-        "isFlaggedFraud": 0,
-        "tx_lat": 40.7128, # Default to NYC for demo
-        "tx_long": -74.0060, # Default to NYC for demo
-    }
+    amount = st.number_input("Amount to Transfer", min_value=1.00, value=100.00, step=50.0, format="%.2f")
 
-    st.subheader("Processing...")
-    
-    with st.spinner("1. Submitting transaction to the processing queue..."):
-        try:
-            submit_response = requests.post(f"{API_URL}/submit_transaction", json=transaction_data, timeout=5)
-            if submit_response.status_code == 202:
-                transaction_id = submit_response.json().get("transaction_id")
-                st.success(f"Transaction received! Processing ID: `{transaction_id}`")
-            else:
-                st.error(f"API Error: {submit_response.status_code} - {submit_response.text}")
-                st.stop()
-        except requests.exceptions.RequestException as e:
-            st.error(f"Could not connect to the API. Is `api.py` running? Error: {e}")
-            st.stop()
-
-    with st.spinner(f"2. Waiting for AI model to analyze transaction `{transaction_id}`..."):
-        prediction_result = None
-        for i in range(15): # Poll for up to 15 seconds
-            try:
-                poll_response = requests.get(f"{API_URL}/get_prediction/{transaction_id}", timeout=2)
-                if poll_response.status_code == 200 and poll_response.json().get("status") == "completed":
-                    prediction_result = poll_response.json()
-                    break
-                time.sleep(1) # Wait 1 second before polling again
-            except requests.exceptions.RequestException:
-                st.error("API connection lost while waiting for result.")
-                st.stop()
-        
-    st.subheader("Result")
-
-    if prediction_result:
-        is_fraud = prediction_result.get("is_fraud")
-        details = prediction_result.get("details", {})
-        
-        if is_fraud:
-            st.error("🔴 **FRAUD DETECTED!** This transaction has been flagged and blocked.", icon="🚨")
+    if st.button("Send Money", use_container_width=True):
+        # Now the comparison will work because both are numbers
+        if amount > sender_balance:
+            st.error("Transfer amount cannot exceed sender's balance.")
         else:
-            st.success("🟢 **Transaction Approved.** This transaction appears to be legitimate.", icon="✅")
-        
-        st.write("Prediction Details:")
-        st.json(details)
-    else:
-        st.warning("Prediction timed out. The system is likely under high load. Please check the consumer logs.", icon="⏳")
+            payload = {
+                "sender_id": sender_id,
+                "receiver_id": receiver_id,
+                "amount": amount
+            }
+            
+            with st.spinner("Submitting transaction for fraud analysis..."):
+                # The rest of the logic is the same and will work correctly
+                submit_response = requests.post(f"{API_URL}/submit_transaction", json=payload)
 
+                if submit_response.status_code != 202:
+                    st.error(f"Failed to submit: {submit_response.json().get('error', 'Unknown API error')}")
+                else:
+                    transaction_id = submit_response.json()['transaction_id']
+                    st.info(f"Transaction submitted (ID: {transaction_id}). Waiting for result...")
+
+                    for _ in range(20):
+                        time.sleep(1)
+                        try:
+                            poll_response = requests.get(f"{API_URL}/get_prediction/{transaction_id}")
+                            if poll_response.status_code == 200 and poll_response.json()['status'] == 'completed':
+                                result = poll_response.json()
+                                if result['is_fraud']:
+                                    st.error("🔴 **Transaction Blocked!** This activity was flagged as potentially fraudulent.", icon="🚨")
+                                else:
+                                    st.success("🟢 **Transaction Approved and Completed!** Balances updated.", icon="✅")
+                                    st.balloons()
+                                
+                                time.sleep(2)
+                                st.rerun()
+                                break
+                        except requests.RequestException:
+                            st.error("Lost connection to API while polling for result.")
+                            break
+                    else:
+                        st.warning("Prediction timed out. The system may be busy. Please check the consumer logs.")
