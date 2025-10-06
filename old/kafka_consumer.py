@@ -8,33 +8,27 @@ import psycopg2
 from geopy.distance import geodesic
 import random
 
-# ...(The top part of your file, including LSTMWrapper, utility functions, and model loading, remains unchanged)...
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-from river import compose, linear_model, metrics, drift, preprocessing, optim
+from river import compose, linear_model, preprocessing, optim
 from sklearn.base import BaseEstimator, ClassifierMixin
 
 class LSTMWrapper(BaseEstimator, ClassifierMixin):
     def __init__(self, model):
         self.model = model
         self.classes_ = None
-
     def fit(self, X, y):
         self.classes_ = np.unique(y)
         X_lstm = np.expand_dims(X, axis=1)
         self.model.fit(X_lstm, y)
         return self
-
     def predict(self, X):
         X_lstm = np.expand_dims(X, axis=1)
         return (self.model.predict(X_lstm) > 0.5).astype(int)
-
     def predict_proba(self, X):
         X_lstm = np.expand_dims(X, axis=1)
         return self.model.predict(X_lstm)
-
     def get_params(self, deep=True):
         return {"model": self.model}
-
     def set_params(self, **parameters):
         for parameter, value in parameters.items():
             setattr(self, parameter, value)
@@ -84,7 +78,6 @@ consumer = Consumer(conf)
 consumer.subscribe([KAFKA_TOPIC])
 print(f"Consumer subscribed to topic '{KAFKA_TOPIC}'. Waiting for messages...")
 
-# --- Main Processing Loop ---
 try:
     while True:
         msg = consumer.poll(1.0)
@@ -98,34 +91,43 @@ try:
         if not transaction_id:
             continue
 
-        print(f"\nProcessing transaction_id: {transaction_id}")
+        print(f"\n[DEBUG] === Processing transaction_id: {transaction_id} ===")
+        print(f"[DEBUG] Raw Kafka Message: {transaction_data}")
+        
         flat_features = flatten_features(transaction_data)
         
-        # ==========================================================
-        # === SOLUTION: HYBRID RULE + AI APPROACH ===
-        # ==========================================================
         is_fraud = False
         rule_triggered = "None"
-
-        # Rule 1: Check for complete account drain on TRANSFER type
-        if (transaction_data.get('type') == 'TRANSFER' and 
-            float(transaction_data.get('amount')) == float(transaction_data.get('oldbalanceOrg'))):
-            is_fraud = True
-            rule_triggered = "Complete Account Drain"
         
-        # If no hard rule was triggered, then proceed to the AI model
+        try:
+            amount_val = float(transaction_data.get('amount', 0))
+            balance_val = float(transaction_data.get('oldbalanceOrg', -1))
+            tx_type = transaction_data.get('type')
+
+            # --- DIAGNOSTIC PRINT STATEMENTS ---
+            print(f"[DEBUG] Rule Check Inputs: amount_val={amount_val}, balance_val={balance_val}, type={tx_type}")
+            print(f"[DEBUG] Is Type 'TRANSFER'? {tx_type == 'TRANSFER'}")
+            print(f"[DEBUG] Absolute difference: {abs(amount_val - balance_val)}")
+            # --- END DIAGNOSTICS ---
+
+            if (tx_type == 'TRANSFER' and abs(amount_val - balance_val) < 0.001):
+                is_fraud = True
+                rule_triggered = "Complete Account Drain"
+        except (ValueError, TypeError) as e:
+            print(f"[DEBUG] ERROR during rule check: {e}")
+            pass
+        
         if not is_fraud:
+            print("[DEBUG] Hard rule not triggered. Proceeding to AI Model.")
             df = pd.DataFrame([flat_features])
             processed_features = preprocessor.transform(df)
             model_prediction = int(offline_model.predict(processed_features)[0])
             if model_prediction == 1:
                 is_fraud = True
                 rule_triggered = "AI Model Flag"
-        # ==========================================================
 
-        print(f"Prediction for {transaction_id}: {'FRAUD' if is_fraud else 'Not Fraud'} (Reason: {rule_triggered})")
+        print(f"[FINAL] Prediction for {transaction_id}: {'FRAUD' if is_fraud else 'Not Fraud'} (Reason: {rule_triggered})")
 
-        # --- Database Finalization Logic ---
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
@@ -137,16 +139,16 @@ try:
                 if sender_id and receiver_id and amount > 0:
                     cursor.execute("UPDATE users SET current_balance = current_balance - %s WHERE user_id = %s;", (amount, sender_id))
                     cursor.execute("UPDATE users SET current_balance = current_balance + %s WHERE user_id = %s;", (amount, receiver_id))
-                    print(f"Balances updated for transaction {transaction_id}.")
+                    print(f"[DB] Balances updated for transaction {transaction_id}.")
 
             prediction_details = {"rule_triggered": rule_triggered}
             cursor.execute("INSERT INTO predictions (transaction_id, is_fraud, prediction_details) VALUES (%s, %s, %s);", (transaction_id, is_fraud, json.dumps(prediction_details)))
             cursor.execute("UPDATE transactions SET status = 'completed' WHERE transaction_id = %s;", (transaction_id,))
             conn.commit()
-            print(f"Database finalized for transaction_id: {transaction_id}")
+            print(f"[DB] Database finalized for transaction_id: {transaction_id}")
 
         except Exception as e:
-            print(f"FATAL: Database update error: {e}")
+            print(f"[DB] FATAL: Database update error: {e}")
             conn.rollback()
         finally:
             cursor.close()
