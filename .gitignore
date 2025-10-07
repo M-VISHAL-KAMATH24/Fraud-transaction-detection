@@ -1,4 +1,9 @@
 # Ignore all CSV files (covers datasets and outputs)
+# Python runtime files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 *.csv
 env/
 env310/
