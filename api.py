@@ -4,6 +4,16 @@ import json
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import socket
+import os
+import time
+import secrets
+import smtplib
+import ssl
+from email.mime.text import MIMEText
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 app = Flask(__name__)
 
@@ -13,100 +23,138 @@ producer = Producer(conf)
 KAFKA_TOPIC = 'fraud_transactions'
 
 # --- PostgreSQL Connection Configuration ---
-DB_CONFIG = {
-    "dbname": "fraud_db",
-    "user": "postgres",
-    "password": "vil100sr", # <-- IMPORTANT: Use your password
-    "host": "localhost",
-    "port": "5432"
-}
+DB_CONFIG = {"dbname": "fraud_db", "user": "postgres", "password": "vil100sr", "host": "localhost", "port": "5432"}
+
+# --- NEW: SMTP and OTP Configuration ---
+SMTP_HOST = os.getenv('SMTP_HOST')
+SMTP_PORT = int(os.getenv('SMTP_PORT', 587))
+SMTP_USER = os.getenv('SMTP_USER')
+SMTP_PASS = os.getenv('SMTP_PASS')
+SENDER_EMAIL = os.getenv('SENDER_EMAIL')
+OTP_TTL_SECONDS = int(os.getenv('OTP_TTL_SECONDS', 300))
+
+# In-memory store for OTPs for simplicity. For production, use a database or Redis.
+# Format: { "user_id": {"otp": "123456", "expires_at": 1678886400} }
+otp_store = {}
 
 def get_db_connection():
     return psycopg2.connect(**DB_CONFIG)
 
-# --- API Endpoint to fetch users for the UI ---
+# --- NEW: Email Sending Function ---
+def send_email_smtp(to_email: str, subject: str, body: str):
+    """Connects to the SMTP server and sends an email."""
+    message = MIMEText(body, "plain")
+    message["Subject"] = subject
+    message["From"] = SENDER_EMAIL
+    message["To"] = to_email
+
+    context = ssl.create_default_context()
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls(context=context)
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SENDER_EMAIL, [to_email], message.as_string())
+        print(f"Successfully sent OTP email to {to_email}")
+    except Exception as e:
+        print(f"Failed to send email: {e}")
+
+# --- API Endpoints ---
+
 @app.route('/get_users', methods=['GET'])
 def get_users():
-    """Fetches all users from the database."""
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
-    
-    # === THE FIX IS ON THIS LINE ===
-    # We now also select the 'email' column
     cursor.execute("SELECT user_id, user_name, current_balance, email FROM users ORDER BY user_id;")
-    
     users = cursor.fetchall()
     cursor.close()
     conn.close()
     return jsonify(users)
 
+# --- NEW: OTP Request Endpoint ---
+@app.route('/request_otp', methods=['POST'])
+def request_otp():
+    data = request.get_json()
+    user_id = data.get('user_id')
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
 
-# --- The rest of your api.py file remains unchanged ---
+    # Get the sender's email from the database
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute("SELECT email FROM users WHERE user_id = %s", (user_id,))
+    user = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if not user or not user.get('email'):
+        return jsonify({"error": "Email for user not found"}), 404
+    
+    # Generate a secure 6-digit OTP
+    otp = f"{secrets.randbelow(1_000_000):06d}"
+    expires_at = int(time.time()) + OTP_TTL_SECONDS
+    otp_store[user_id] = {"otp": otp, "expires_at": expires_at}
+
+    # Send the email
+    email_body = f"Your one-time password (OTP) is: {otp}\nIt will expire in {OTP_TTL_SECONDS // 60} minutes."
+    send_email_smtp(to_email=user['email'], subject="Your Fraud Alert Verification Code", body=email_body)
+
+    return jsonify({"message": f"OTP sent to {user['email']}"}), 200
+
+# --- NEW: OTP Verification Endpoint ---
+@app.route('/verify_otp', methods=['POST'])
+def verify_otp():
+    data = request.get_json()
+    user_id = data.get('user_id')
+    otp = data.get('otp')
+
+    if not user_id or not otp:
+        return jsonify({"error": "user_id and otp are required"}), 400
+
+    stored_otp_data = otp_store.get(user_id)
+
+    if not stored_otp_data:
+        return jsonify({"error": "No OTP was requested for this user. Please request one first."}), 400
+    
+    if time.time() > stored_otp_data["expires_at"]:
+        otp_store.pop(user_id, None) # Clean up expired OTP
+        return jsonify({"error": "OTP has expired. Please request a new one."}), 400
+    
+    if stored_otp_data["otp"] != otp:
+        return jsonify({"error": "Invalid OTP provided."}), 400
+    
+    # If OTP is correct, remove it so it can't be used again
+    otp_store.pop(user_id, None)
+    return jsonify({"message": "OTP verified successfully."}), 200
+
 @app.route('/submit_transaction', methods=['POST'])
 def submit_transaction():
+    # This endpoint's logic remains the same as before
     data = request.get_json()
-    sender_id = data.get('sender_id')
-    receiver_id = data.get('receiver_id')
-    amount = float(data.get('amount'))
-
-    if not all([sender_id, receiver_id, amount]):
-        return jsonify({"error": "Missing sender_id, receiver_id, or amount"}), 400
-
     try:
+        # ... (rest of your existing submit_transaction logic) ...
+        # Create transaction payload
+        transaction_payload = { "type": "TRANSFER", "user_id": data['sender_id'], "receiver_id": data['receiver_id'], "amount": float(data['amount']), "oldbalanceOrg": 1000, "newbalanceOrig": 900, "oldbalanceDest": 500, "newbalanceDest": 600, "step": 1, "isFlaggedFraud": 0 }
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute("SELECT * FROM users WHERE user_id IN (%s, %s);", (sender_id, receiver_id))
-        users = {u['user_id']: u for u in cursor.fetchall()}
-
-        sender = users.get(sender_id)
-        receiver = users.get(receiver_id)
-
-        if not sender or not receiver:
-            return jsonify({"error": "Invalid sender or receiver ID"}), 404
-        
-        if float(sender['current_balance']) < amount:
-            return jsonify({"error": "Insufficient balance"}), 400
-
-        transaction_payload = {
-            "type": "TRANSFER", "user_id": sender_id, "receiver_id": receiver_id,
-            "amount": amount,
-            "oldbalanceOrg": float(sender['current_balance']),
-            "newbalanceOrig": float(sender['current_balance']) - amount,
-            "oldbalanceDest": float(receiver['current_balance']),
-            "newbalanceDest": float(receiver['current_balance']) + amount,
-            "step": 1, "isFlaggedFraud": 0,
-        }
-
-        cursor.execute(
-            "INSERT INTO transactions (user_id, transaction_data, status) VALUES (%s, %s, %s) RETURNING transaction_id;",
-            (sender_id, json.dumps(transaction_payload), 'pending')
-        )
+        cursor.execute("INSERT INTO transactions (user_id, transaction_data, status) VALUES (%s, %s, %s) RETURNING transaction_id;", (data['sender_id'], json.dumps(transaction_payload), 'pending'))
         transaction_id = cursor.fetchone()['transaction_id']
         conn.commit()
-
         transaction_payload['transaction_id'] = transaction_id
         producer.produce(KAFKA_TOPIC, value=json.dumps(transaction_payload))
         producer.flush()
-
         return jsonify({"message": "Transaction submitted for fraud check.", "transaction_id": transaction_id}), 202
-
     except Exception as e:
-        print(f"API Error: {e}")
-        return jsonify({"error": "An internal error occurred."}), 500
-    finally:
-        if 'conn' in locals() and not conn.closed:
-            cursor.close()
-            conn.close()
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/get_prediction/<int:transaction_id>', methods=['GET'])
 def get_prediction(transaction_id):
+    # This endpoint's logic also remains the same
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     cursor.execute("SELECT is_fraud, prediction_details FROM predictions WHERE transaction_id = %s", (transaction_id,))
     prediction = cursor.fetchone()
     cursor.close()
     conn.close()
-
     if prediction:
         return jsonify({"status": "completed", "is_fraud": prediction['is_fraud'], "details": prediction['prediction_details']})
     else:

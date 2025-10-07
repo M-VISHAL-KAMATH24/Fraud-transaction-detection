@@ -4,20 +4,28 @@ import joblib
 import pandas as pd
 import psycopg2
 from confluent_kafka import Consumer
+import smtplib
+import ssl
+from email.mime.text import MIMEText
+from dotenv import load_dotenv
 
-# This is the path to the NEW, CORRECT model file you will create
+# Load environment variables for email
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
+
+# --- Email and SMTP Configuration ---
+SMTP_HOST = os.getenv('SMTP_HOST')
+SMTP_PORT = int(os.getenv('SMTP_PORT', 587))
+SMTP_USER = os.getenv('SMTP_USER')
+SMTP_PASS = os.getenv('SMTP_PASS')
+SENDER_EMAIL = os.getenv('SENDER_EMAIL')
+
+# --- Model Loading (unchanged) ---
 MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'models', 'final_fraud_model.pkl')
-
 try:
-    # We only load the ONE, UNIFIED pipeline file.
     fraud_pipeline = joblib.load(MODEL_PATH)
     print("Final, unified fraud detection pipeline loaded successfully.")
 except Exception as e:
-    print("--------------------------------------------------------------------")
-    print(f"FATAL ERROR: Could not load the pipeline model at '{MODEL_PATH}'.")
-    print("Please run the 'train_model.py' script first to generate it.")
-    print(f"Details: {e}")
-    print("--------------------------------------------------------------------")
+    print(f"FATAL ERROR: Could not load the pipeline model. Details: {e}")
     exit()
 
 # --- DB and Kafka Configuration (unchanged) ---
@@ -27,9 +35,30 @@ conf = {'bootstrap.servers': 'localhost:9092', 'group.id': 'fraud_detector_group
 
 def get_db_connection(): return psycopg2.connect(**DB_CONFIG)
 
+# --- NEW: Email Sending Function ---
+def send_email_alert(to_email: str, subject: str, body: str):
+    if not all([SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SENDER_EMAIL]):
+        print("SMTP configuration is missing. Cannot send email.")
+        return
+    
+    message = MIMEText(body, "plain")
+    message["Subject"] = subject
+    message["From"] = SENDER_EMAIL
+    message["To"] = to_email
+
+    context = ssl.create_default_context()
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls(context=context)
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SENDER_EMAIL, [to_email], message.as_string())
+        print(f"Successfully sent alert email to {to_email}")
+    except Exception as e:
+        print(f"Failed to send email alert: {e}")
+
 consumer = Consumer(conf)
 consumer.subscribe([KAFKA_TOPIC])
-print("Consumer ready with the new, correct pipeline.")
+print("Consumer ready to send email alerts.")
 
 try:
     while True:
@@ -47,24 +76,38 @@ try:
             
             amount_val = float(tx_data.get('amount', 0))
             balance_val = float(tx_data.get('oldbalanceOrg', 0))
+            
+            # --- UPDATED: Get sender email for alerts ---
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT email FROM users WHERE user_id = %s", (tx_data['user_id'],))
+            sender_email_row = cursor.fetchone()
+            sender_email = sender_email_row[0] if sender_email_row else None
+            cursor.close()
+            conn.close()
 
-            # Rule 1: Hard-coded check for complete account drain
+            # Rule 1: Check for full drain
             if tx_data.get('type') == 'TRANSFER' and abs(amount_val - balance_val) < 0.01:
                 is_fraud = True
                 rule_triggered = "BLOCK: Complete Account Drain"
+                if sender_email:
+                    subject = "Security Alert: Transaction Blocked"
+                    body = f"Dear User,\n\nA transaction from your account was blocked because it attempted to transfer your entire balance of ${balance_val:,.2f}. Your account has been secured. Please contact support if you did not authorize this."
+                    send_email_alert(sender_email, subject, body)
             
-            # Rule 2: Use the unified AI pipeline for all other cases
+            # Rule 2: Check with AI
             if not is_fraud:
-                # The model was trained on specific columns. We must provide them.
                 features_for_prediction = ['type', 'amount', 'oldbalanceOrg', 'newbalanceOrig', 'oldbalanceDest', 'newbalanceDest']
                 df = pd.DataFrame([tx_data])[features_for_prediction]
-                
-                # Feed the RAW data directly to the pipeline. It handles everything.
                 prediction = fraud_pipeline.predict(df)
-                
                 if int(prediction[0]) == 1:
                     is_fraud = True
                     rule_triggered = "AI Model Flag"
+                    # For a general AI flag, you could also send an alert
+                    if sender_email:
+                        subject = "Security Alert: Suspicious Transaction Blocked"
+                        body = f"Dear User,\n\nA transaction of ${amount_val:,.2f} from your account was blocked due to suspicious activity detected by our system. No funds have been transferred."
+                        send_email_alert(sender_email, subject, body)
 
             print(f"Result: {'FRAUD' if is_fraud else 'Not Fraud'} (Reason: {rule_triggered})")
             
@@ -86,3 +129,4 @@ except KeyboardInterrupt:
     print("\nConsumer shutting down.")
 finally:
     consumer.close()
+
