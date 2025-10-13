@@ -17,7 +17,7 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# --- Kafka Producer Configuration ---
+# --- Kafka Producer Configuration (unchanged) ---
 conf = {'bootstrap.servers': 'localhost:9092', 'client.id': socket.gethostname()}
 producer = Producer(conf)
 KAFKA_TOPIC = 'fraud_transactions'
@@ -41,8 +41,11 @@ def get_db_connection():
     return psycopg2.connect(**DB_CONFIG)
 
 # --- NEW: Email Sending Function ---
-def send_email_smtp(to_email: str, subject: str, body: str):
-    """Connects to the SMTP server and sends an email."""
+def send_email_alert(to_email: str, subject: str, body: str):
+    """Send an email via configured SMTP if credentials exist."""
+    if not all([SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SENDER_EMAIL]):
+        print("SMTP configuration is missing. Cannot send email.")
+        return
     message = MIMEText(body, "plain")
     message["Subject"] = subject
     message["From"] = SENDER_EMAIL
@@ -54,9 +57,9 @@ def send_email_smtp(to_email: str, subject: str, body: str):
             server.starttls(context=context)
             server.login(SMTP_USER, SMTP_PASS)
             server.sendmail(SENDER_EMAIL, [to_email], message.as_string())
-        print(f"Successfully sent OTP email to {to_email}")
+        print(f"Successfully sent alert email to {to_email}")
     except Exception as e:
-        print(f"Failed to send email: {e}")
+        print(f"Failed to send email alert: {e}")
 
 # --- API Endpoints ---
 
@@ -70,7 +73,7 @@ def get_users():
     conn.close()
     return jsonify(users)
 
-# --- NEW: OTP Request Endpoint ---
+# --- OTP Endpoints (unchanged) ---
 @app.route('/request_otp', methods=['POST'])
 def request_otp():
     data = request.get_json()
@@ -88,7 +91,7 @@ def request_otp():
 
     if not user or not user.get('email'):
         return jsonify({"error": "Email for user not found"}), 404
-    
+
     # Generate a secure 6-digit OTP
     otp = f"{secrets.randbelow(1_000_000):06d}"
     expires_at = int(time.time()) + OTP_TTL_SECONDS
@@ -96,11 +99,10 @@ def request_otp():
 
     # Send the email
     email_body = f"Your one-time password (OTP) is: {otp}\nIt will expire in {OTP_TTL_SECONDS // 60} minutes."
-    send_email_smtp(to_email=user['email'], subject="Your Fraud Alert Verification Code", body=email_body)
+    send_email_alert(to_email=user['email'], subject="Your Fraud Alert Verification Code", body=email_body)
 
     return jsonify({"message": f"OTP sent to {user['email']}"}), 200
 
-# --- NEW: OTP Verification Endpoint ---
 @app.route('/verify_otp', methods=['POST'])
 def verify_otp():
     data = request.get_json()
@@ -114,18 +116,19 @@ def verify_otp():
 
     if not stored_otp_data:
         return jsonify({"error": "No OTP was requested for this user. Please request one first."}), 400
-    
+
     if time.time() > stored_otp_data["expires_at"]:
         otp_store.pop(user_id, None) # Clean up expired OTP
         return jsonify({"error": "OTP has expired. Please request a new one."}), 400
-    
+
     if stored_otp_data["otp"] != otp:
         return jsonify({"error": "Invalid OTP provided."}), 400
-    
+
     # If OTP is correct, remove it so it can't be used again
     otp_store.pop(user_id, None)
     return jsonify({"message": "OTP verified successfully."}), 200
 
+# --- Core Transaction Endpoint (unchanged) ---
 @app.route('/submit_transaction', methods=['POST'])
 def submit_transaction():
     # This endpoint's logic remains the same as before
@@ -133,7 +136,18 @@ def submit_transaction():
     try:
         # ... (rest of your existing submit_transaction logic) ...
         # Create transaction payload
-        transaction_payload = { "type": "TRANSFER", "user_id": data['sender_id'], "receiver_id": data['receiver_id'], "amount": float(data['amount']), "oldbalanceOrg": 1000, "newbalanceOrig": 900, "oldbalanceDest": 500, "newbalanceDest": 600, "step": 1, "isFlaggedFraud": 0 }
+        transaction_payload = {
+            "type": "TRANSFER",
+            "user_id": data['sender_id'],
+            "receiver_id": data['receiver_id'],
+            "amount": float(data['amount']),
+            "oldbalanceOrg": 1000,
+            "newbalanceOrig": 900,
+            "oldbalanceDest": 500,
+            "newbalanceDest": 600,
+            "step": 1,
+            "isFlaggedFraud": 0
+        }
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         cursor.execute("INSERT INTO transactions (user_id, transaction_data, status) VALUES (%s, %s, %s) RETURNING transaction_id;", (data['sender_id'], json.dumps(transaction_payload), 'pending'))
@@ -148,7 +162,6 @@ def submit_transaction():
 
 @app.route('/get_prediction/<int:transaction_id>', methods=['GET'])
 def get_prediction(transaction_id):
-    # This endpoint's logic also remains the same
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     cursor.execute("SELECT is_fraud, prediction_details FROM predictions WHERE transaction_id = %s", (transaction_id,))
