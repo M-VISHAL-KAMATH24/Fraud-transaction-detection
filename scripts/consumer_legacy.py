@@ -10,13 +10,8 @@ import math
 
 # ANSI color codes for impressive terminal output
 class colors:
-    HEADER = '\033[95m'
-    OKBLUE = '\033[94m'
-    OKGREEN = '\033[92m'
-    WARNING = '\033[93m'  # FIX: Added the missing WARNING color
-    FAIL = '\033[91m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
+    HEADER = '\033[95m'; OKBLUE = '\033[94m'; OKGREEN = '\033[92m'
+    WARNING = '\033[93m'; FAIL = '\033[91m'; ENDC = '\033[0m'; BOLD = '\033[1m'
 
 # LSTMWrapper class (unchanged)
 from sklearn.base import BaseEstimator, ClassifierMixin
@@ -29,8 +24,7 @@ class LSTMWrapper(BaseEstimator, ClassifierMixin):
         X_lstm = np.expand_dims(X, axis=1); return self.model.predict(X_lstm)
     def get_params(self, deep=True): return {"model": self.model}
     def set_params(self, **params):
-        for k, v in params.items(): setattr(self, k, v)
-        return self
+        for k, v in params.items(): setattr(self, k, v); return self
 
 # Load models
 MODEL_PATH = os.path.join(os.path.dirname(__file__), '..', 'models', 'ensemble_model.pkl')
@@ -50,13 +44,13 @@ def haversine(lat1, lon1, lat2, lon2):
 
 # Kafka config
 consumer = Consumer({
-    'bootstrap.servers': 'localhost:9092', 'group.id': 'fraud_detector_legacy_v4',
+    'bootstrap.servers': 'localhost:9092', 'group.id': 'fraud_detector_legacy_final',
     'auto.offset.reset': 'earliest', 'enable.auto.commit': False
 })
 consumer.subscribe(['fraud_transactions'])
 
-print(f"{colors.HEADER}--- Legacy Consumer Ready (Presentation Mode) ---{colors.ENDC}")
-geo_threshold_km = 500
+print(f"{colors.HEADER}--- Legacy Consumer Ready (Final Presentation Mode) ---{colors.ENDC}")
+geo_threshold_km, frequent_tx_threshold, frequent_tx_window_mins = 500, 5, 2
 
 while True:
     msg = consumer.poll(1.0)
@@ -72,46 +66,44 @@ while True:
         print(f"\n{colors.HEADER}==================================================================={colors.ENDC}")
         print(f"{colors.BOLD}Received Legacy TX:{colors.ENDC} {tx_id} | {colors.BOLD}User:{colors.ENDC} {user_id}")
         
-        # 1. Geo Fraud Rule
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # --- Rule 1: Frequent Transaction ---
+        cursor.execute("SELECT COUNT(*) FROM transactions_legacy_demo WHERE user_id = %s AND created_at >= (NOW() - INTERVAL '%s minutes')", (user_id, frequent_tx_window_mins))
+        freq_count = cursor.fetchone()[0]
+        freq_fraud = freq_count >= frequent_tx_threshold
+
+        # --- Rule 2: Geo Distance ---
         distance = haversine(data.get('billing_lat',0), data.get('billing_long',0), data.get('tx_lat',0), data.get('tx_long',0))
         geo_fraud = distance > geo_threshold_km
 
-        # 2. Full Account Drain Rule
+        # --- Rule 3: Full Drain Attempt ---
         drain_fraud = oldbalanceOrg > 0 and abs(amount - oldbalanceOrg) < 1
 
-        # 3. ML Model Prediction
-        df = pd.DataFrame([data])
-        processed = preprocessor.transform(df)
+        # --- Rule 4: ML Model ---
+        df = pd.DataFrame([data]); processed = preprocessor.transform(df)
         ml_pred = model.predict(processed)[0]
         
-        # Combine rules to make a final decision
-        is_fraud = False
-        reasons = []
-        if geo_fraud:
-            is_fraud = True
-            reasons.append("Geo Anomaly (>500km)")
-        if drain_fraud:
-            is_fraud = True
-            reasons.append("Account Drain Attempt")
-        if ml_pred == 1:
-            if not is_fraud: # Only add ML reason if no other rule caught it
-                is_fraud = True
-                reasons.append("Suspicious Pattern (ML Model)")
+        # Combine rules for final verdict
+        is_fraud, reasons = False, []
+        if freq_fraud: is_fraud = True; reasons.append(f"Frequent Transactions ({freq_count + 1} in {frequent_tx_window_mins}m)")
+        if geo_fraud: is_fraud = True; reasons.append(f"Geo Anomaly ({distance:,.0f}km)")
+        if drain_fraud: is_fraud = True; reasons.append("Full Account Drain")
+        if ml_pred == 1 and not is_fraud: is_fraud = True; reasons.append("Suspicious Pattern (ML Model)")
 
-        # Colorful verdict
+        # Display verdict
         if is_fraud:
             print(f"{colors.FAIL}{colors.BOLD}>>> FRAUD DETECTED <<<{colors.ENDC}")
             print(f"  - {colors.WARNING}{colors.BOLD}Reason(s):{colors.ENDC} {', '.join(reasons)}")
         else:
             print(f"{colors.OKGREEN}{colors.BOLD}>>> TRANSACTION OK <<<{colors.ENDC}")
 
-        # Show details
+        # Display details
         print(f"  - {colors.BOLD}Amount:{colors.ENDC} ${amount:,.2f} | {colors.BOLD}Type:{colors.ENDC} {data.get('type')}")
-        print(f"  - {colors.BOLD}Geo Distance:{colors.ENDC} {distance:,.0f} km")
+        print(f"  - {colors.BOLD}Geo Distance:{colors.ENDC} {distance:,.0f} km | {colors.BOLD}Old Balance:{colors.ENDC} ${oldbalanceOrg:,.2f}")
 
         # Save to DB
-        conn = get_db_connection()
-        cursor = conn.cursor()
         cursor.execute("INSERT INTO transactions_legacy_demo (user_id, transaction_data, status) VALUES (%s, %s, %s);", (user_id, json.dumps(data), 'completed'))
         cursor.execute("INSERT INTO predictions_legacy_demo (transaction_id, is_fraud, prediction_details) VALUES (%s, %s, %s);", (tx_id, is_fraud, json.dumps({'rule': ', '.join(reasons) if reasons else 'None'})))
         conn.commit()
